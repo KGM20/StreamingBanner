@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Overlay de predicciones</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Semi+Condensed:wght@500;600;700&display=swap" rel="stylesheet">
+<style>
+:root{
+  --panel:rgba(13,15,23,.92);--ink:#F2F0EB;--mute:#9AA0B4;--track:rgba(255,255,255,.09);
+  --time:#FFC857;--low:#FF6B6B;
+  --c0:#3FA7FF;--c1:#FF5FA8;--c2:#5EE6A8;--c3:#FFA94D;--c4:#B28DFF;
+  --c5:#4FE3E8;--c6:#FF8A80;--c7:#D4E157;--c8:#8D9BFF;--c9:#F48FB1;
+}
+html{font-size:16px}
+html,body{margin:0;background:transparent;overflow:hidden;color:var(--ink);
+  font-family:'Barlow Semi Condensed',system-ui,sans-serif}
+body{padding:10px}
+#panel{position:relative;overflow:hidden;border-radius:10px;background:var(--panel);
+  border:1px solid rgba(255,255,255,.08);opacity:0;transform:translateY(-10px);
+  transition:opacity .35s ease,transform .35s ease}
+#panel.on{opacity:1;transform:none}
+.clock{height:5px;background:var(--track)}
+.clock i{display:block;height:100%;width:100%;background:var(--time)}
+.clock.low i{background:var(--low)}
+#panel:not([data-state=active]) .clock{visibility:hidden}
+.body{padding:.8rem 1.1rem 1rem}
+.top{display:flex;align-items:flex-start;justify-content:space-between;gap:1rem;margin-bottom:.8rem}
+#title{margin:0;font-size:1.3rem;font-weight:700;line-height:1.15;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+#status{flex:none;font-size:1.7rem;font-weight:700;line-height:1;color:var(--time);
+  font-variant-numeric:tabular-nums}
+#panel[data-state=locked] #status,#panel[data-state=resolved] #status,
+#panel[data-state=canceled] #status{font-size:1.05rem;color:var(--mute);font-weight:600;padding-top:.15rem}
+.opt{margin-bottom:.7rem}
+.head{display:flex;justify-content:space-between;gap:1rem;margin-bottom:.3rem}
+.name{font-size:1.1rem;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pts{flex:none;font-size:.98rem;font-weight:500;color:var(--mute);font-variant-numeric:tabular-nums}
+.bar{height:10px;border-radius:10px;background:var(--track);overflow:hidden}
+.bar i{display:block;height:100%;width:0;border-radius:10px;transition:width .6s ease}
+.opt.lose{opacity:.4}
+.opt.win .name{color:#fff}
+.opt.win .pts{color:var(--ink)}
+.foot{font-size:.9rem;color:var(--mute);font-variant-numeric:tabular-nums}
+#note{margin-top:8px;padding:.5rem .8rem;border-radius:10px;background:var(--panel);
+  font-size:.95rem;color:var(--low);display:none}
+@media (prefers-reduced-motion:reduce){#panel,.bar i{transition:none}}
+</style>
+</head>
+<body>
+<div id="panel" data-state="active">
+  <div class="clock"><i id="clockFill"></i></div>
+  <div class="body">
+    <div class="top"><h1 id="title"></h1><div id="status"></div></div>
+    <div id="opts"></div>
+    <div class="foot" id="foot"></div>
+  </div>
+</div>
+<div id="note"></div>
+
+<script>
+/* ---------- Configuración (por URL) ----------
+   ?token=XXXX   token de usuario del streamer con el permiso channel:read:predictions
+   &scale=1.2    tamaño del widget
+   &demo         modo demostración (sin Twitch)                                  */
+const q = new URLSearchParams(location.search);
+if (q.get('token')) { try { localStorage.setItem('pred_token', q.get('token')); } catch (e) {} }
+let TOKEN = q.get('token'); try { TOKEN = TOKEN || localStorage.getItem('pred_token'); } catch (e) {}
+if (q.get('scale')) document.documentElement.style.fontSize = (16 * parseFloat(q.get('scale'))) + 'px';
+
+const $ = id => document.getElementById(id);
+const panel = $('panel'), optsEl = $('opts');
+const fmt = n => n.toLocaleString('es-MX');
+const mmss = ms => { const s = Math.ceil(ms / 1000); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); };
+
+let pred = null, shown = false, hideT = null;
+const rows = new Map();
+
+/* ---------- Render ---------- */
+function render() {
+  panel.classList.toggle('on', shown);
+  if (!pred) return;
+  panel.dataset.state = pred.status;
+  $('title').textContent = pred.title;
+  $('status').textContent = { locked: 'Apuestas cerradas', resolved: 'Resultado', canceled: 'Cancelada' }[pred.status] || '';
+  const total = pred.outcomes.reduce((a, o) => a + o.points, 0);
+  const votes = pred.outcomes.reduce((a, o) => a + o.users, 0);
+
+  const ids = pred.outcomes.map(o => o.id).join();
+  if (optsEl.dataset.ids !== ids) {
+    optsEl.innerHTML = ''; rows.clear(); optsEl.dataset.ids = ids;
+    pred.outcomes.forEach((o, i) => {
+      const el = document.createElement('div');
+      el.className = 'opt';
+      el.innerHTML = '<div class="head"><span class="name"></span><span class="pts"></span></div><div class="bar"><i></i></div>';
+      el.querySelector('i').style.background = 'var(--c' + (i % 10) + ')';
+      optsEl.appendChild(el); rows.set(o.id, el);
+    });
+  }
+  pred.outcomes.forEach(o => {
+    const el = rows.get(o.id); if (!el) return;
+    const pct = total ? Math.round(o.points / total * 100) : 0;
+    const won = pred.status === 'resolved' && pred.winner === o.id;
+    el.querySelector('.name').textContent = o.title;
+    el.querySelector('.pts').textContent = (won ? 'Ganó · ' : '') + fmt(o.points) + ' pts · ' + pct + '%';
+    el.querySelector('i').style.width = (total ? o.points / total * 100 : 0) + '%';
+    el.classList.toggle('win', won);
+    el.classList.toggle('lose', pred.status === 'resolved' && !won);
+  });
+  $('foot').textContent = pred.status === 'canceled'
+    ? 'Se devolvieron los puntos'
+    : fmt(total) + ' pts en juego · ' + fmt(votes) + (votes !== 1 ? ' personas han apostado' : ' persona ha apostado');
+}
+
+function show(p) { clearTimeout(hideT); pred = p; shown = true; render(); tick(); }
+function hide() { shown = false; render(); }
+function tick() {
+  if (!pred || pred.status !== 'active') return;
+  const left = Math.max(0, pred.locksAt - Date.now());
+  const span = pred.locksAt - pred.startedAt;
+  $('status').textContent = mmss(left);
+  $('clockFill').style.width = (span > 0 ? left / span * 100 : 0) + '%';
+  $('clockFill').parentNode.classList.toggle('low', left < 10000);
+}
+setInterval(tick, 200);
+
+function note(txt) { const n = $('note'); n.textContent = txt; n.style.display = 'block'; console.error(txt); }
+
+/* ---------- Twitch ---------- */
+const mapOut = arr => (arr || []).map(o => ({ id: o.id, title: o.title, points: o.channel_points || 0, users: o.users || 0 }));
+let uid, H;
+
+function applyEvent(e, status) {
+  const base = (pred && pred.id === e.id) ? pred : {};
+  return Object.assign(base, {
+    id: e.id, title: e.title, status,
+    outcomes: mapOut(e.outcomes),
+    startedAt: e.started_at ? Date.parse(e.started_at) : base.startedAt,
+    locksAt: e.locks_at ? Date.parse(e.locks_at) : (e.locked_at ? Date.parse(e.locked_at) : base.locksAt)
+  });
+}
+
+function handle(type, e) {
+  if (type === 'channel.prediction.begin') show(applyEvent(e, 'active'));
+  else if (type === 'channel.prediction.progress') show(applyEvent(e, 'active'));
+  else if (type === 'channel.prediction.lock') show(applyEvent(e, 'locked'));
+  else if (type === 'channel.prediction.end') {
+    const p = applyEvent(e, e.status === 'resolved' ? 'resolved' : 'canceled');
+    p.winner = e.winning_outcome_id;
+    show(p);
+    hideT = setTimeout(hide, p.status === 'resolved' ? 12000 : 6000);
+  }
+}
+
+async function loadCurrent() {
+  const r = await fetch('https://api.twitch.tv/helix/predictions?broadcaster_id=' + uid + '&first=1', { headers: H });
+  if (!r.ok) return;
+  const p = (await r.json()).data[0];
+  if (p && (p.status === 'ACTIVE' || p.status === 'LOCKED')) {
+    const t0 = Date.parse(p.created_at);
+    show({ id: p.id, title: p.title, status: p.status.toLowerCase(), outcomes: mapOut(p.outcomes),
+           startedAt: t0, locksAt: t0 + p.prediction_window * 1000 });
+  } else if (pred && (pred.status === 'active' || pred.status === 'locked')) hide();
+}
+
+async function subscribe(sessionId) {
+  const types = ['begin', 'progress', 'lock', 'end'];
+  const res = await Promise.all(types.map(t => fetch('https://api.twitch.tv/helix/eventsub/subscriptions', {
+    method: 'POST', headers: Object.assign({ 'Content-Type': 'application/json' }, H),
+    body: JSON.stringify({ type: 'channel.prediction.' + t, version: '1',
+      condition: { broadcaster_user_id: uid }, transport: { method: 'websocket', session_id: sessionId } })
+  })));
+  if (res.some(r => r.status === 401 || r.status === 403)) note('Twitch rechazó la suscripción: revisa que el token sea del streamer y no haya caducado.');
+}
+
+const WS_URL = 'wss://eventsub.wss.twitch.tv/ws';
+let current = null;
+function connect(url, isReconnect) {
+  const ws = new WebSocket(url);
+  let timeout = 15000, wd;
+  const arm = () => { clearTimeout(wd); wd = setTimeout(() => ws.close(), timeout); };
+  ws.onmessage = async ev => {
+    const m = JSON.parse(ev.data); arm();
+    const t = m.metadata.message_type;
+    if (t === 'session_welcome') {
+      const s = m.payload.session;
+      timeout = ((s.keepalive_timeout_seconds || 10) + 5) * 1000; arm();
+      const old = current; current = ws; if (old && old !== ws) old.close();
+      if (!isReconnect) { await subscribe(s.id); loadCurrent(); }
+    } else if (t === 'session_reconnect') connect(m.payload.session.reconnect_url, true);
+    else if (t === 'notification') handle(m.payload.subscription.type, m.payload.event);
+    else if (t === 'revocation') note('Twitch revocó la suscripción (token vencido o permisos retirados).');
+  };
+  ws.onclose = () => { clearTimeout(wd); if (current === ws || current === null) { current = null; setTimeout(() => connect(WS_URL, false), 3000); } };
+}
+
+async function start() {
+  if (!TOKEN) return note('Falta el token. Agrega ?token=TU_TOKEN a la URL del origen de navegador.');
+  const v = await fetch('https://id.twitch.tv/oauth2/validate', { headers: { Authorization: 'OAuth ' + TOKEN } });
+  if (!v.ok) return note('El token no es válido o ya caducó. Genera uno nuevo.');
+  const me = await v.json();
+  if (!(me.scopes || []).includes('channel:read:predictions')) return note('Al token le falta el permiso channel:read:predictions.');
+  uid = me.user_id;
+  H = { Authorization: 'Bearer ' + TOKEN, 'Client-Id': me.client_id };
+  connect(WS_URL, false);
+}
+
+/* ---------- Demo ---------- */
+function demo() {
+  const t0 = Date.now();
+  const o = [{ id: 'a', title: 'Sí, lo logra', points: 0, users: 0 }, { id: 'b', title: 'No, cae en el jefe', points: 0, users: 0 }];
+  show({ id: 'd', title: '¿Pasa al jefe final en el primer intento?', outcomes: o, startedAt: t0, locksAt: t0 + 30000, status: 'active' });
+  const iv = setInterval(() => { o.forEach(x => { x.points += Math.floor(Math.random() * 1500); x.users += Math.floor(Math.random() * 4); }); render(); }, 1200);
+  setTimeout(() => { pred.status = 'locked'; render(); }, 30000);
+  setTimeout(() => { pred.status = 'resolved'; pred.winner = 'a'; render(); clearInterval(iv); }, 37000);
+  setTimeout(() => { hide(); setTimeout(demo, 3000); }, 47000);
+}
+
+q.has('demo') ? demo() : start();
+</script>
+</body>
+</html>
